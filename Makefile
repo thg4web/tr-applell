@@ -48,7 +48,8 @@ ifneq ($(wildcard $(OT_WOZ)),)
 OT_FILES = $(SD_DISK)
 endif
 
-test: build/cpu-test build/bootdisk.po build/test-disk all module-test $(OT_FILES)
+# The Oregon Trail files come before module-test, which plays the game from build/sd/OREGON.PO.
+test: build/cpu-test build/bootdisk.po build/test-disk all $(OT_FILES) module-test
 	@if [ -f third-party/dormann/6502_functional_test.bin ]; then ./build/cpu-test; \
 	 else echo "skip the CPU test (fetch Klaus Dormann's 6502 functional test into third-party/dormann/: see README.md)"; fi
 	./tests/test-monitor.sh
@@ -82,7 +83,7 @@ build/oregon-keys.txt: tests/oregon-keys.sh | build
 build/test-module: teensy/test-module.cpp teensy/apple2-module.cpp emu/cpu6502.c emu/a2.c emu/a2.h emu/cpu6502.h emu/badlist.h emu/tone.c emu/tone.h emu/stick.c emu/stick.h emu/diskimg.c emu/diskimg.h build/rom-images.h build/demo-program.h build/oregon-keys.txt
 	c++ -std=c++17 -O2 -Wall -Wextra -I teensyrom-build/vm/tests -o $@ teensy/test-module.cpp
 
-module-test: build/test-module build/test-client
+module-test: build/test-module build/test-client build/bootdisk.po $(OT_FILES)
 	mkdir -p build/module-sandbox
 	./build/test-module build/module-sandbox
 	./build/test-client build/apple2-client.bin build/apple2-client.sym
