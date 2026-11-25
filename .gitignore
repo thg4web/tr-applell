@@ -1,0 +1,16 @@
+.DS_Store
+# Local working instructions and scripts, not published
+scripts/
+.claude/
+CLAUDE.md
+# Generated
+build/
+__pycache__/
+*.log
+# Superseded copies
+.archived/
+# Things beside the repo, never in it: your own disk images (disks/, a folder or a link) and the upstream TeensyROM build
+/disks
+/teensyrom-build
+# Dormann's 6502 functional test: no licence file came with our copy; fetch it (see README.md)
+third-party/dormann/

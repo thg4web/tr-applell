@@ -1,0 +1,744 @@
+; apple2-client.a: the C64 half of TR ][ on the TeensyROM+ (ACME assembler).
+;
+; Based on upstream TeensyROM's reference client Source/C64/VMHello/vmhello.a (MIT,
+; Copyright the TeensyROM authors): the cartridge layout, cold start, packet reader, CRC
+; and the Ultimax start stub are theirs. Ours: keyboard reading, the Apple key mapping,
+; and input records that are resent until the host takes them.
+;
+; Link (upstream's): EasyFlash IO2 window at $DF00, opened by selecting bank 58.
+;   $DF00..$DFEF  published packet: "M3" 01 type seq flags len 00 <payload> crc16
+;   $DFF4 command (1 start, 3 input ready), $DFF5 status ($E0 failed), $DFF6 acknowledge,
+;   $DFF7 sequence published, $DFF8..$DFFA input, $DFFB failure code,
+;   $DFFC token the host last took, $DFFD..$DFFF input protocol, token, checksum.
+; Our protocol with apple2-module.cpp:
+;   packet type 1: payload[0] row 0-24, payload[1] colour, payload[2..41] screen codes.
+;   packet type 2: payload[0] the first text row: 0 all text, 20 the Apple's mixed hi-res, 24 full
+;   hi-res. Above it a raster interrupt shows a hires bitmap ($2000, colours in screen RAM $0400),
+;   which the module writes by DMA (TR+ C64 transfer, service bit 20); below it, text as before.
+;   DMA slices: the main loop grants one ($DFF0) each time round, except in the few raster lines
+;   before an interrupt of ours is due (a slice holds the CPU off the bus for about 2 lines).
+;   packet type 3: SID voice 1. payload[0] = its control register: $40 pulse or $80 noise, bit 0 the
+;   gate; payload[1-2] Fn, payload[3-4] pulse width (12-bit). Written as it comes: frequency and width
+;   first, the control last (see sound). Voice 1 is set up at start with AD $00, SR $F0 (attack and
+;   release about 2 and 6 ms, one rate for all three, so the SID's envelope delay bug cannot happen).
+;   input, protocol $A2: buttons = Apple key, display = flags (1 Reset, 2 quit, 4 type the demo) and
+;   joystick port 2 in bits 3-7 (8 up, $10 down, $20 left, $40 right, $80 fire), on every record;
+;   overflow = event number. The stick moving is an event of its own (no key, no flags).
+; Joystick port 2 shares $DC00 with the keyboard's columns. Once a frame, in the timer interrupt, the
+; stick is read with no column driven ($DC00 = $FF), so held keys cannot add to it; it counts once two
+; frames agree (contact bounce). A stick pulls its columns low, so a key held in one of those columns
+; (DEL RETURN F1-F8, 3 W A 4 Z S E, 5 R D 6 C F T X, 7 Y G 8 B H U V, 9 I J 0 M K O N, left SHIFT, by
+; direction and fire) would show in every column of the KERNAL's scan. With no column driven, such a
+; key pulls a row low: then the scan is left out for that frame (the clock still runs), and keys are
+; read again once the key or the stick lets go. Keys in the other columns read normally meanwhile.
+; Keys: letters and symbols as typed (Apple ][ Plus is upper case), RETURN, DEL and
+; CRSR-left = Apple left arrow, CRSR-right = right arrow, RUN/STOP = Ctrl-C,
+; <- (top left) = Esc, CTRL+letter = Ctrl-letter, F1 = Apple Reset, F7 = quit to TR menu,
+; F3 = key readout on/off (client only: the Apple never sees it; off at start),
+; F5 = the module types the demo program (CAVE DIVER) into BASIC.
+; Input flags: 1 Reset, 2 quit, 4 type the demo.
+HOSTBANK   = 58
+IO2        = $DF00
+CMD        = $DFF4
+STATUS     = $DFF5
+ACK        = $DFF6
+SEQ        = $DFF7
+FAILCODE   = $DFFB
+TAKEN      = $DFFC
+SCREEN     = $0400
+GRANT      = $DFF0        ; a write here lets the host's next DMA slice run (VMABI.h, service bit 20)
+TOPLINE    = 20           ; raster line of the interrupt that turns the bitmap on (top border)
+COLOUR     = $D800
+GETIN      = $FFE4
+; Free RAM once the cartridge cold start has run.
+packetbuf  = $C000        ; 238 bytes
+total      = $C100
+crcn       = $C101
+crclo      = $C102
+crchi      = $C103
+lastseq    = $C104
+token      = $C106
+evkey      = $C107
+evflags    = $C108
+evseq      = $C109
+pending    = $C10A
+tmpkey     = $C10B
+tmpflags   = $C10C
+showkeys   = $C10D        ; 0 = key readout hidden (F3 toggles)
+row24col   = $C10E        ; colour of the module's last row 24
+row24save  = $C110        ; 12 bytes: what the module last sent for row 24, columns 28-39
+split      = $C120        ; the first text row: 0 all text (no raster interrupt), 20 or 24
+splitLine  = $C121        ; raster line of the interrupt that turns text back on: 49 + 8 x split
+irqphase   = $C122        ; 0 the next raster interrupt is the top one, 1 the split
+sidCtrl    = $C123        ; what SID voice 1's control register holds
+stick      = $C124        ; joystick port 2 in bits 3-7, as the input record carries it (debounced)
+stickRaw   = $C125        ; the last frame's reading, for the debounce
+sentStick  = $C126        ; the stick on the record the host last took
+stickOut   = $C127        ; the stick on the record being offered
+flagsOut   = $C128        ; the flag byte being offered (event flags and stick)
+SID        = $D400
+ptr        = $FB
+cptr       = $FD
+
+; ---------------------------------------------------------------- ROML $8000
+* = $8000
+        !word coldstart
+        !word coldstart
+        !byte $C3, $C2, $CD, $38, $30    ; CBM80
+
+coldstart:
+        sei
+        ; The KERNAL jumps straight here on finding the cartridge, before it has
+        ; initialised anything, so the cartridge does it. (upstream)
+        jsr $FDA3                ; IOINIT
+        jsr $FD50                ; RAMTAS
+        jsr $FD15                ; RESTOR
+        jsr $FF5B                ; CINT
+        cli
+        jsr $E544                ; clear screen
+        lda #0
+        sta $D020
+        sta $D021
+        sta lastseq
+        sta token
+        sta evseq
+        sta pending
+        sta showkeys             ; key readout starts hidden
+        sta split                ; all text until the module says otherwise
+        sta irqphase
+        sta stick                ; the joystick at rest until read
+        sta stickRaw
+        sta sentStick
+        sei                      ; our interrupt handler first: raster interrupts, else the KERNAL's
+        lda #<irq
+        sta $0314
+        lda #>irq
+        sta $0315
+        cli
+        jsr sidInit
+        lda #15
+        sta row24col
+        lda #$20                 ; until the module sends row 24: spaces
+        ldx #11
+clearSave:
+        sta row24save, x
+        dex
+        bpl clearSave
+        lda #$80
+        sta $0291                ; no C=+SHIFT character set switch
+        ldx #0
+banner:
+        lda bannerText, x
+        beq bannerDone
+        sta SCREEN, x
+        lda #15
+        sta COLOUR, x
+        inx
+        bne banner
+bannerDone:
+        ; Open the host window, then ask the module to start. (upstream)
+        lda #HOSTBANK
+        sta $DE00
+        lda #1
+        sta CMD
+
+main:
+        lda STATUS
+        cmp #$E0
+        bne running
+        jmp failed
+running:
+        jsr grant
+        lda SEQ
+        beq noPacket             ; nothing published yet
+        cmp lastseq
+        beq noPacket             ; already consumed this one
+        jsr readPacket
+        bcc noPacket             ; bad frame: leave it, the host will hold it
+        lda packetbuf + 4        ; the sequence the packet itself carries
+        sta lastseq
+        sta ACK
+noPacket:
+        lda showkeys
+        beq readoutOff
+        jsr showMatrix           ; key readout (diagnostic, 2026-11-24; F3 shows it)
+readoutOff:
+        lda pending
+        beq idle
+        jsr trySend
+        jmp main
+idle:
+        jsr checkStick           ; the stick moved: an event of its own carries it
+        bcc idleKeys
+        jmp main
+idleKeys:
+        jsr GETIN
+        beq main
+        pha
+        ldx showkeys
+        beq idleNoHex1
+        ldx #34
+        jsr showHex              ; the character the KERNAL gave us
+idleNoHex1:
+        pla
+        jsr mapKey
+        sta tmpkey
+        stx tmpflags
+        lda showkeys
+        beq idleNoHex2
+        lda tmpkey
+        ldx #37
+        jsr showHex              ; what we send to the Apple
+idleNoHex2:
+        lda tmpkey
+        ldx tmpflags
+        jsr queueEvent
+        jmp main
+
+; F3: show or hide the key readout. Hiding it puts back what the module last sent for
+; those columns (a long STOPPED line reaches column 33).
+toggleKeys:
+        lda showkeys
+        eor #1
+        sta showkeys
+        bne tkDone               ; now shown: the main loop paints it
+        ldx #11
+tkRestore:
+        lda row24save, x
+        sta SCREEN + 24 * 40 + 28, x
+        lda row24col
+        sta COLOUR + 24 * 40 + 28, x
+        dex
+        bpl tkRestore
+tkDone:
+        rts
+
+; ---- Key readout (diagnostic) ------------------------------------------------
+; Bottom row, columns 28-39: "MX mm pp kk" = KERNAL matrix code of the key held
+; now ($CB, $40 = none), the last character GETIN returned, and the Apple key sent.
+showMatrix:
+        lda #13                  ; 'M'
+        sta SCREEN + 24 * 40 + 28
+        lda #24                  ; 'X'
+        sta SCREEN + 24 * 40 + 29
+        lda #1
+        sta COLOUR + 24 * 40 + 28
+        sta COLOUR + 24 * 40 + 29
+        lda $CB                  ; KERNAL: matrix code of the key held now
+        ldx #31
+showHex:                         ; A as two hex digits at row 24, column X, in white
+        pha
+        lsr
+        lsr
+        lsr
+        lsr
+        jsr nybble
+        sta SCREEN + 24 * 40, x
+        pla
+        and #$0F
+        jsr nybble
+        sta SCREEN + 24 * 40 + 1, x
+        lda #1
+        sta COLOUR + 24 * 40, x
+        sta COLOUR + 24 * 40 + 1, x
+        rts
+
+; ---- Copy, validate and apply the published packet (upstream) --------------
+badFrame:
+        clc
+        rts
+
+readPacket:
+        lda IO2 + 0
+        cmp #$4D                 ; 'M'
+        bne badFrame
+        lda IO2 + 1
+        cmp #$33                 ; '3'
+        bne badFrame
+        lda IO2 + 2
+        cmp #1                   ; framing version
+        bne badFrame
+        lda IO2 + 6              ; payload length
+        cmp #229
+        bcs badFrame
+        clc
+        adc #8
+        sta crcn
+        clc
+        adc #2
+        sta total
+        ldy #0
+copyLoop:
+        lda IO2, y
+        sta packetbuf, y
+        iny
+        cpy total
+        bne copyLoop
+        lda #$FF
+        sta crclo
+        sta crchi
+        ldy #0
+crcLoop:
+        lda packetbuf, y
+        jsr updateCrc
+        iny
+        cpy crcn
+        bne crcLoop
+        ldy crcn
+        lda packetbuf, y
+        cmp crclo
+        bne badFrame
+        iny
+        lda packetbuf, y
+        cmp crchi
+        bne badFrame
+        lda packetbuf + 3        ; type: unknown ones are acknowledged and ignored
+        cmp #3
+        bne notSound
+        jsr sound
+        jmp consumed
+notSound:
+        cmp #2
+        bne notMode
+        lda packetbuf + 8        ; payload[0]: the first text row
+        jsr setSplit
+        jmp consumed
+notMode:
+        cmp #1
+        bne consumed
+        ldx packetbuf + 8        ; payload[0]: screen row
+        cpx #25
+        bcs consumed
+        lda rowLo, x
+        sta ptr
+        sta cptr
+        lda rowHi, x
+        sta ptr + 1
+        lda colourHi, x
+        sta cptr + 1
+        ldy #0
+paintLoop:
+        lda packetbuf + 10, y    ; payload[2 + y]
+        sta (ptr), y
+        lda packetbuf + 9        ; payload[1]: colour
+        sta (cptr), y
+        iny
+        cpy #40
+        bne paintLoop
+        cpx #24                  ; the status row: keep columns 28-39 for F3 to put back
+        bne consumed
+        ldy #11
+saveLoop:
+        lda packetbuf + 10 + 28, y
+        sta row24save, y
+        dey
+        bpl saveLoop
+        lda packetbuf + 9
+        sta row24col
+consumed:
+        sec
+        rts
+
+; CRC16-CCITT, MSB first, polynomial $1021 -- the same one the host computes. (upstream)
+; ---- hi-res: the raster split and the DMA grants ----
+setSplit:                        ; A = the first text row: 0 all text, else 20 or 24
+        sei
+        sta split
+        cmp #0
+        beq ssText
+        asl
+        asl
+        asl
+        clc
+        adc #49                  ; two lines before that row's first line (51 + 8 x row), off badlines
+        sta splitLine
+        lda #0
+        sta irqphase
+        lda #TOPLINE
+        sta $D012
+        lda $D011
+        and #$7F                 ; raster compare bit 8 off
+        sta $D011
+        lda #1
+        sta $D019                ; drop a stale raster flag
+        sta $D01A                ; raster interrupts on
+        cli
+        rts
+ssText:
+        lda #0
+        sta $D01A                ; raster interrupts off
+        lda #1
+        sta $D019
+        lda #$1B                 ; text mode, characters from ROM, screen at $0400
+        sta $D011
+        lda #$15
+        sta $D018
+        cli
+        rts
+
+irq:                             ; reached from the KERNAL's $FF48 with A, X, Y pushed
+        lda $D019
+        bpl kernalIrq            ; bit 7: an enabled VIC source asks (bit 0 latches even when off)
+        sta $D019                ; acknowledge the raster interrupt
+        lda irqphase
+        bne irqSplit
+        lda #$3B                 ; the top: bitmap mode, bitmap $2000, its colours at $0400
+        sta $D011
+        lda #$18
+        sta $D018
+        lda splitLine
+        sta $D012
+        inc irqphase
+        jmp $EA81                ; KERNAL: pull Y, X, A and RTI
+irqSplit:
+        lda #$1B                 ; the first text row: text mode again
+        sta $D011
+        lda #$15
+        sta $D018
+        lda #TOPLINE
+        sta $D012
+        lda #0
+        sta irqphase
+        jmp $EA81
+kernalIrq:
+        lda $DC0D                ; acknowledge the CIA timer first, so that interrupts can come back on:
+        cli                      ; a raster interrupt due during the keyboard scan is then on time
+        jsr readStick            ; port 2, once a frame; A = rows held low with no column driven
+        bne kiNoScan             ; a key in a column the stick pulls: the scan would see phantom keys
+        jmp $EA31                ; the KERNAL's own handler (keyboard, clock)
+kiNoScan:
+        jsr $FFEA                ; the clock only (UDTIM); keys are read again once that key or the stick lets go
+        jmp $EA81                ; KERNAL: pull Y, X, A and RTI
+
+readStick:                       ; out: stick (when two frames agree); A = rows a held key pulls low, 0 none
+        lda #$FF
+        sta $DC00                ; no keyboard column driven: only the stick pulls port A
+        lda $DC00
+        eor #$FF
+        and #$1F                 ; 1 = pressed: bit 0 up, 1 down, 2 left, 3 right, 4 fire
+        asl
+        asl
+        asl                      ; bits 3-7, as the input record carries them
+        cmp stickRaw
+        sta stickRaw
+        bne rsRows               ; not the same as the last frame: wait for the next to agree
+        sta stick
+rsRows:
+        lda $DC01                ; with no column driven a row is low only through a key in a pulled column
+        tax
+        lda #$7F
+        sta $DC00                ; column 7 again, as the KERNAL leaves it (its STOP key check reads that)
+        txa
+        eor #$FF
+        rts
+
+checkStick:                      ; C set: the stick has moved since the host last took it; an event now carries it
+        lda stick
+        cmp sentStick
+        beq csNone
+        lda #0
+        sta evkey
+        sta evflags
+        inc evseq
+        lda #1
+        sta pending
+        sec
+        rts
+csNone:
+        clc
+        rts
+
+; ---- SID voice 1 (packet type 3) ----
+sidInit:                         ; at start: voice 1 ready, voices 2 and 3 silent, no filter, volume 15
+        lda #0
+        ldx #$18
+siClear:
+        sta SID, x               ; every register 0: no waveform, no gate, no filter, volume 0
+        dex
+        bpl siClear
+        lda #$F0
+        sta SID + 6              ; voice 1 sustain 15, release 0 (AD stays $00: attack 0, decay 0)
+        lda #$0F
+        sta SID + $18            ; volume 15, no filter
+        lda #$40
+        sta sidCtrl              ; voice 1: pulse, gate off
+        rts
+
+; A type 3 packet. Frequency and width go first and the control register last: a gate-on starts at the new
+; pitch and width, a gate-off releases at the pitch it had (the module repeats it), and pulse to noise or
+; back is a single write, so the voice never holds two waveforms at once. Noise mixed with another waveform
+; is what can stall the noise generator (and only the test bit, held for many thousands of cycles, frees
+; it), so noise always goes out alone and no test bit is needed.
+sound:
+        lda packetbuf + 9
+        sta SID + 0              ; Fn low
+        lda packetbuf + 10
+        sta SID + 1              ; Fn high
+        lda packetbuf + 11
+        sta SID + 2              ; pulse width low
+        lda packetbuf + 12
+        sta SID + 3              ; pulse width high (bits 0-3)
+        lda packetbuf + 8
+        and #$01                 ; the gate
+        bit packetbuf + 8
+        bmi sdNoise
+        ora #$40                 ; pulse
+        bne sdCtrl
+sdNoise:
+        ora #$80                 ; noise, alone
+sdCtrl:
+        sta SID + 4
+        sta sidCtrl
+        rts
+
+silence:                         ; voice 1's gate off: the release takes it down in about 6 ms
+        lda sidCtrl
+        and #$F0
+        sta sidCtrl
+        sta SID + 4
+        rts
+
+grant:                           ; let the host's next DMA slice run, unless one of our raster
+        lda split                ; interrupts is due within the slice (about 2 lines)
+        beq doGrant              ; all text: no raster interrupts to keep on time
+        bit $D011
+        bmi doGrant              ; lines 256 and over: far from both
+        lda $D012
+        sec
+        sbc #TOPLINE - 5
+        cmp #7
+        bcc noGrant              ; from 5 lines before the top interrupt to 1 after
+        lda $D012
+        sec
+        sbc splitLine
+        clc
+        adc #5
+        cmp #7
+        bcc noGrant              ; the same around the split
+doGrant:
+        sta GRANT
+noGrant:
+        rts
+
+updateCrc:
+        eor crchi
+        sta crchi
+        ldx #8
+crcBit:
+        asl crclo
+        rol crchi
+        bcc crcNext
+        lda crchi
+        eor #$10
+        sta crchi
+        lda crclo
+        eor #$21
+        sta crclo
+crcNext:
+        dex
+        bne crcBit
+        rts
+
+; ---- Keys (ours) -------------------------------------------------------------
+; In: A = PETSCII from GETIN. Out: A = Apple key (0 = none), X = flags.
+mapKey:
+        ldx #0
+        cmp #$85                 ; F1: Apple Reset
+        bne mkNotF1
+        jsr silence              ; the Apple stops: so does its sound, at once
+        ldx #1
+        lda #0
+        rts
+mkNotF1:
+        cmp #$88                 ; F7: quit to the TeensyROM menu
+        bne mkNotF7
+        jsr silence
+        ldx #2
+        lda #0
+        rts
+mkNotF7:
+        cmp #$86                 ; F3: key readout on/off (stays in the client)
+        bne mkNotF3
+        jsr toggleKeys
+        ldx #0
+        lda #0
+        rts
+mkNotF3:
+        cmp #$87                 ; F5: the module types the demo program into BASIC
+        bne mkNotF5
+        ldx #4
+        lda #0
+        rts
+mkNotF5:
+        cmp #$14                 ; DEL
+        beq mkLeft
+        cmp #$9D                 ; CRSR left
+        beq mkLeft
+        cmp #$1D                 ; CRSR right: Apple right arrow (Ctrl-U)
+        bne mkNotRight
+        lda #$15
+        rts
+mkLeft:
+        lda #$08                 ; Apple left arrow
+        rts
+mkNotRight:
+        cmp #$5F                 ; the <- key: Esc
+        bne mkNotEsc
+        lda #$1B
+        rts
+mkNotEsc:
+        cmp #$20
+        bcc mkControl            ; $01-$1F: RETURN, RUN/STOP ($03) and CTRL+letter codes
+        cmp #$60
+        bcc mkSame               ; $20-$5F: the same as ASCII (pound = backslash)
+        cmp #$C1
+        bcc mkNone
+        cmp #$DB
+        bcs mkNone
+        and #$7F                 ; shifted letters: the Apple ][ Plus has only upper case
+mkSame:
+        rts
+mkControl:
+        cmp #$1B
+        bcc mkSame               ; $01-$1A pass through as Apple control codes
+mkNone:
+        lda #0
+        rts
+
+; A = key, X = flags. Starts a new event unless both are zero.
+queueEvent:
+        sta evkey
+        stx evflags
+        ora evflags
+        beq qeDone
+        inc evseq
+        lda #1
+        sta pending
+qeDone:
+        rts
+
+; Offer the pending event. The host drops a record while it still holds the last one,
+; so check that it took this token; if not, the main loop offers it again.
+trySend:
+        lda evkey
+        sta $DFF8                ; buttons
+        lda stick
+        sta stickOut             ; the stick as it is now rides on every record
+        ora evflags
+        sta flagsOut
+        sta $DFF9                ; display
+        lda evseq
+        sta $DFFA                ; overflow
+        lda #$A2
+        sta $DFFD                ; protocol
+tsToken:
+        inc token
+        beq tsToken              ; zero means "no input"
+        lda token
+        cmp TAKEN
+        beq tsToken              ; must differ from the token the host took last
+        sta $DFFE
+        lda #$A5
+        eor evkey
+        eor flagsOut
+        eor evseq
+        eor #$A2
+        eor token
+        sta $DFFF                ; checksum
+        lda #3
+        sta CMD
+        lda TAKEN
+        cmp token
+        bne tsLater
+        lda #0
+        sta pending
+        lda stickOut
+        sta sentStick            ; the host has this stick now
+tsLater:
+        rts
+
+; ---- Failure (upstream) ----------------------------------------------------
+failed:
+        jsr silence
+        ldx #0
+messageLoop:
+        lda failMessage, x
+        beq showCode
+        sta SCREEN + 24 * 40, x
+        lda #2                   ; red
+        sta COLOUR + 24 * 40, x
+        inx
+        bne messageLoop
+showCode:
+        lda FAILCODE
+        pha
+        lsr
+        lsr
+        lsr
+        lsr
+        jsr nybble
+        sta SCREEN + 24 * 40 + 17
+        pla
+        and #$0F
+        jsr nybble
+        sta SCREEN + 24 * 40 + 18
+        lda #2
+        sta COLOUR + 24 * 40 + 17
+        sta COLOUR + 24 * 40 + 18
+stop:
+        jmp stop
+
+nybble:
+        cmp #10
+        bcc digit
+        adc #6                   ; carry is set: 'A' is screen code 1
+digit:
+        clc
+        adc #$30
+        and #$3F
+        rts
+
+failMessage:
+        !scr "extension failed "
+        !byte 0
+bannerText:
+        !scr "tr ][ starting..."
+        !byte 0
+
+rowLo:
+        !for row, 0, 24 { !byte <(SCREEN + row * 40) }
+rowHi:
+        !for row, 0, 24 { !byte >(SCREEN + row * 40) }
+colourHi:
+        !for row, 0, 24 { !byte >(COLOUR + row * 40) }
+
+        !fill $A000 - *, $FF
+
+; ---------------------------------------------------------------- ROMH $E000
+; Upstream's Ultimax start stub, unchanged: the firmware starts the cartridge in
+; Ultimax, where this bank answers at $E000 and holds the reset vector; it switches
+; to 16 KiB mode from a RAM stub and hands back to the KERNAL, which then finds the
+; CBM80 header above.
+!pseudopc $E000 {
+        !fill $FF00 - $E000, $FF
+ultimax:
+        sei
+        ldx #$FF
+        txs
+        cld
+        ldx #7
+copyStub:
+        lda stub, x
+        sta $0100, x             ; below the stack, which starts at $01FF
+        dex
+        bpl copyStub
+        jmp $0100
+stub:
+        !byte $A9, $87           ; lda #$87   LED on, 16 KiB mode: GAME and EXROM asserted
+        !byte $8D, $02, $DE      ; sta $DE02
+        !byte $4C, $E2, $FC      ; jmp $FCE2  KERNAL reset, which finds the cartridge
+        !fill $FFFA - *, $FF
+        !word ultimax            ; NMI
+        !word ultimax            ; RESET
+        !word ultimax            ; IRQ
+}
