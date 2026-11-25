@@ -53,9 +53,13 @@ int dimg_open(dimg *d, const char *name, uint32_t file_bytes, const uint8_t *hea
     } else if (dimg_same(ext, "dsk") || dimg_same(ext, "do")) {
         if (bytes != DIMG_525_BYTES) { d->why = "a .dsk or .do is 143,360 bytes"; return -1; }
         d->kind = DIMG_525; d->order = DIMG_DOS;
-    } else if (dimg_same(ext, "po")) {
+    } else if (dimg_same(ext, "woz") || dimg_same(ext, "nib") || dimg_same(ext, "d13")) {
+        d->why = "a disk format this layer does not read as blocks (.woz .nib .d13)"; return -1;
+    } else {
+        /* .po, and any other extension (a package's own, for side-by-side test copies): ProDOS-order blocks,
+           as the module read every image before this layer; the size must still be whole blocks. */
         d->order = DIMG_PRODOS;
-    } else { d->why = "not a disk image extension (.dsk .do .po .2mg)"; return -1; }
+    }
     if (d->kind == DIMG_NONE) {                     /* ProDOS order: 140K is a 5.25-inch disk, else blocks */
         if (bytes == 0 || (bytes & 511) || (bytes >> 9) > 65535) { d->why = "not a whole number of 512-byte blocks"; return -1; }
         d->kind = bytes == DIMG_525_BYTES ? DIMG_525 : DIMG_BLOCKS;

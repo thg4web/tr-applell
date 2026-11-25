@@ -190,8 +190,16 @@ int main(int argc, char **argv) {
            "OREGON.PO (800K): blocks in ProDOS order from byte 0, as before");
     expect(open_mem(&dd, "x.dsk", &m140short) != 0 && open_mem(&dd, "x.dsk", &m800) != 0, "a .dsk that is not 143,360 bytes: refused");
     expect(open_mem(&dd, "x.po", &modd) != 0, "a .po that is not whole blocks: refused");
-    expect(open_mem(&dd, "x.woz", &mdsk) != 0 && open_mem(&dd, "noext", &mdsk) != 0 && open_mem(&dd, "dir.po/file", &mdsk) != 0,
-           "other extensions, none, or a dot only in a folder name: refused");
+    expect(open_mem(&dd, "/OREGON.A2M", &m800) == 0 && dd.kind == DIMG_BLOCKS && dd.order == DIMG_PRODOS && dd.offset == 0 && dd.blocks == 1600 &&
+           dimg_read_block(&dd, 1599, b) == 0 && b[0] == (uint8_t)1599,
+           "a package's own extension (OREGON.A2M, 800K): ProDOS-order blocks, as before the layer");
+    expect(open_mem(&dd, "game.xyz", &mpo) == 0 && dd.kind == DIMG_525 && dd.order == DIMG_PRODOS && same_disk(&dd, &dpo),
+           "any other extension at 143,360 bytes: read as a .po (5.25-inch, ProDOS order)");
+    expect(open_mem(&dd, "x.a2m", &modd) != 0, "an unknown extension that is not whole blocks: refused");
+    expect(open_mem(&dd, "x.woz", &mdsk) != 0 && open_mem(&dd, "x.nib", &mdsk) != 0 && open_mem(&dd, "x.d13", &mdsk) != 0,
+           ".woz, .nib and .d13: refused (this layer does not read them as blocks)");
+    expect(open_mem(&dd, "noext", &mdsk) != 0 && open_mem(&dd, "dir.po/file", &mdsk) != 0,
+           "no extension, or a dot only in a folder name: refused");
     expect(dimg_read_block(&ddsk, 280, b) != 0 && dimg_read_sector(&ddsk, 35, 0, b) != 0 && dimg_read_sector(&dd, 0, 0, b) != 0,
            "past the end, or a sector asked of a block device: refused");
 

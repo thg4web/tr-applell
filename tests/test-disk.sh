@@ -41,9 +41,10 @@ struct.pack_into('<IIIII', hdr, 12, 0, 0, 0, 64, 143360)                       #
 for name, data in (('bootdisk-140k.po', po), ('bootdisk-140k.dsk', dos), ('bootdisk-140k.2mg', hdr + dos)):
     open(f'{out}/{name}', 'wb').write(data)
 PY
-for f in build/bootdisk-140k.po build/bootdisk-140k.dsk build/bootdisk-140k.2mg; do
+cp build/bootdisk.po build/bootdisk.a2m                                          # a package's own extension
+for f in build/bootdisk-140k.po build/bootdisk-140k.dsk build/bootdisk-140k.2mg build/bootdisk.a2m; do
     out=$(./build/a2term --headless --disk "$f" --seconds 1)
-    check "a2term boots the test disk from ${f#build/}" "$out" 'BOOT OK FROM BLOCK 0' 'BLOCK 1 VIA PRODOS DRIVER' 'BLOCK 2 VIA SMARTPORT' 'disk: 5.25-inch'
+    check "a2term boots the test disk from ${f#build/}" "$out" 'BOOT OK FROM BLOCK 0' 'BLOCK 1 VIA PRODOS DRIVER' 'BLOCK 2 VIA SMARTPORT' 'disk: '
 done
 out=$(./build/a2term --headless --disk build/bootdisk-140k.dsk --seconds 1 | sed -n 's/^disk: //p')
 check "a2term names the format" "$out" '5.25-inch, DOS order, 280 blocks'

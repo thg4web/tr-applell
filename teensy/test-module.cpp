@@ -74,8 +74,8 @@ static void saveC64View(const std::filesystem::path &file) {
 }
 // The Apple's colour at dot x of line y by the standard model, worked out here on its own (not with the module's
 // code): a lit dot next to a lit dot is white, a lone lit dot is its column's colour (palette bit: blue/orange,
-// else violet/green), an unlit dot between two lone lit dots takes their colour. As C64 colours: black 0, white
-// 1, violet 4, green 13, blue 3, orange 8. Dot x shows at C64 pixel x + 16.
+// else violet/green) and shows two dots wide, so the unlit dot after it takes its colour. As C64 colours: black 0,
+// white 1, violet 4, green 13, blue 3, orange 8. Dot x shows at C64 pixel x + 16.
 static uint8_t appleC64Colour(int x, int y) {
     if (x < 0 || x >= 280) return 0;
     auto on = [&](int i) { return i >= 0 && i < 280 && appleDot(i, y); };
@@ -84,7 +84,7 @@ static uint8_t appleC64Colour(int x, int y) {
         return uint8_t(pal ? ((i & 1) ? 8 : 3) : ((i & 1) ? 13 : 4));
     };
     if (on(x)) return (on(x - 1) || on(x + 1)) ? 1 : col(x);
-    if (on(x - 1) && on(x + 1) && !on(x - 2) && !on(x + 2)) return col(x - 1);
+    if (on(x - 1) && !on(x - 2)) return col(x - 1);
     return 0;
 }
 // Pixels the C64 shows in another colour than the Apple's, counting only cells that hold one or two model colours
@@ -362,7 +362,9 @@ int main(int argc, char **argv) {
         g.insert(g.end(), dos.begin(), dos.end());          // format 0: DOS order
         std::ofstream(sandbox / "BOOT140.2MG", std::ios::binary | std::ios::trunc).write(g.data(), std::streamsize(g.size()));
         std::ofstream(sandbox / "JUNK.DSK", std::ios::binary | std::ios::trunc).write(dos.data(), 1000);
-        struct Case { const char *file, *note; } cases[] = { { "BOOT140.DSK", "DISK BOOT140.DSK 0 BAD BLOCKS" },
+        std::ofstream(sandbox / "TEST.A2M", std::ios::binary | std::ios::trunc).write(po.data(), 3 * 512);   // a package's own extension
+        struct Case { const char *file, *note; } cases[] = { { "TEST.A2M", "DISK TEST.A2M 0 BAD BLOCKS" },
+                                                             { "BOOT140.DSK", "DISK BOOT140.DSK 0 BAD BLOCKS" },
                                                              { "BOOT140.2MG", "DISK (READ ONLY) BOOT140.2MG 0 BAD BLOCK" } };   // the note stops at 40 columns
         for (const Case &c : cases) {
             for (auto &row : screen) { std::memset(row, ' ', 40); row[40] = 0; }
@@ -374,7 +376,7 @@ int main(int argc, char **argv) {
             const bool booted = onScreen("BOOT OK FROM BLOCK 0") && onScreen("BLOCK 1 VIA PRODOS DRIVER") && onScreen("BLOCK 2 VIA SMARTPORT");
             char what[160];
             std::snprintf(what, sizeof what, "%s from the card: \"%s\", and the card boots it through the layer (ProDOS and SmartPort reads)", c.file, c.note);
-            expect(onScreen(c.note) && booted && disk.blocks == 280, what);
+            expect(onScreen(c.note) && booted && disk.blocks == (std::strstr(c.file, ".A2M") ? 3u : 280u), what);
         }
         type("300:A9 02 85 42 A9 50 85 43 A9 00 85 44 A9 10 85 45 A9 03 85 46 A9 00 85 47 20 40 C5 00\n300G\n");
         run(0.5);
@@ -408,7 +410,9 @@ int main(int argc, char **argv) {
         std::ifstream kf(oregonKeys);
         const std::string keys((std::istreambuf_iterator<char>(kf)), std::istreambuf_iterator<char>());
         if (!keys.empty()) {
-            host = VmNativeHost::makeWithExit(root, (sandbox / "OREGON.PO").string(), workspace.data(),
+            // Launched from a package's own extension (OREGON.A2M, a copy beside OREGON.PO; its list is still OREGON.BAD).
+            std::filesystem::copy_file(oregon, sandbox / "OREGON.A2M", std::filesystem::copy_options::overwrite_existing);
+            host = VmNativeHost::makeWithExit(root, (sandbox / "OREGON.A2M").string(), workspace.data(),
                                               uint32_t(workspace.size()), guest.data(), uint32_t(guest.size()));
             host.base.micros_now = fakeMicros;
             mod = vm_entry(&host.base);
@@ -417,6 +421,7 @@ int main(int argc, char **argv) {
             M.speaker_hook = recordClick;
             stickNow = 0;
             const size_t name = keys.find("OSCAR");
+            expect(M.card_slot == 5 && disk.blocks == 1600 && M.disk_bad && M.disk_bad[8], "OREGON.A2M attaches as Oregon Trail's 1,600 blocks, block 8 on the list");
             playKeys(keys.substr(0, name));             // to the first name prompt
             run(0.5);
             const uint8_t keyBefore = M.key;
@@ -476,6 +481,14 @@ int main(int argc, char **argv) {
         convertHires();
         expect(colNext[4] == 0x10 && bmNext[4 * 8] == 0xF0 && bmNext[4 * 8 + 1] == 0x98 && bmNext[4 * 8 + 2] == 0xF0 &&
                bmNext[3 * 8 + 1] == 0x01, "white strokes on black stay dot for dot (text keeps its full width)");
+        // Sparse colour keeps its weight: one green dot in four lit (bytes $11 $22 $44 $08 ... on line 0) shows two
+        // dots wide, as on a colour TV (Apple colour is 140 across): half the cell green, not a quarter.
+        std::memset(&M.ram[0x2000], 0, 0x2000);
+        for (int i = 0; i < 40; ++i) for (int bit = 0; bit < 7; ++bit) if ((i * 7 + bit) % 4 == 1) M.ram[a2_hires_row(&M, 0) + i] |= uint8_t(1 << bit);
+        convertHires();
+        int lit = 0;
+        for (int cx = 4; cx < 34; ++cx) for (int b = 0; b < 8; ++b) lit += (bmNext[cx * 8] >> b) & 1;
+        expect(lit == 30 * 4 && (colNext[10] >> 4) == 13, "sparse colour (one dot in four) lights two pixels in four, in green: as bright as a colour TV shows it");
         M.text = 1; M.hires = 0;
     }
 

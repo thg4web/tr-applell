@@ -282,8 +282,9 @@ void ack() { awaitingAck = false; inflightRow = -1; }
 
 // The Apple's hi-res colours by the standard model (Apple II Reference Manual 1979: a lit dot alone shows its
 // column's colour, even columns violet and odd green, the eighth bit swapping in blue and orange; two lit dots
-// side by side are white; an unlit dot between two lone lit dots of a colour shows that colour, so a colour
-// area is solid): 0 black, 1 white, 2 violet, 3 green, 4 blue, 5 orange. As the C64 shows them:
+// side by side are white): 0 black, 1 white, 2 violet, 3 green, 4 blue, 5 orange. A lone colour dot shows two
+// dots wide, as on a colour TV, where the Apple's colour is 140 across: the unlit dot after it takes its colour
+// (so a colour area, every other dot lit, is solid, and sparse colour keeps its weight). As the C64 shows them:
 constexpr uint8_t kC64Of[6] = { 0, 1, 4, 13, 3, 8 };    // black, white, purple, light green, cyan, orange
 // The same six as RGB (the C64 palette as Philip Timmermann measured it, "Pepto"), to say which of a cell's
 // two colours a third one is nearer to.
@@ -311,7 +312,7 @@ void appleLine(int y, uint8_t *out) {
         const uint8_t *o = &on[2 + x];
         uint8_t c = 0;
         if (o[0]) c = (o[-1] | o[1]) ? 1 : hue[x];
-        else if (o[-1] & o[1] & !o[-2] & !o[2]) c = hue[x - 1];
+        else if (o[-1] & !o[-2]) c = hue[x - 1];   // the dot after a lone colour dot: its colour, two wide
         out[kLeft + x] = c;
     }
 }

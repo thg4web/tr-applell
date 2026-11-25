@@ -10,7 +10,10 @@
  *              (800K: 819,200; up to 65,535 blocks): a block device in ProDOS order (Oregon Trail's .po).
  *   .2mg .2img a 64-byte header ("2IMG"), then the data at the header's offset: format 0 DOS order (143,360
  *              bytes), 1 ProDOS order (whole blocks); 2 (nibbles) is not supported; flag bit 31 = locked.
- * Anything else is refused, and so is a size that does not fit its extension.
+ *   any other  as .po: ProDOS-order blocks if the size is whole blocks (a package's own extension, such as
+ *              .a2m, so a test copy of an image can sit beside the original), as before this layer.
+ * Refused: no extension, .woz .nib .d13 (formats this layer does not read as blocks), and a size that does not
+ * fit its extension.
  *
  * Orders: a DOS-order file holds each track's sectors as DOS 3.3 numbers them (logical 0-15); a ProDOS-order
  * file holds them as ProDOS does (block b = track b / 8, its two halves). The two differ by one table,
