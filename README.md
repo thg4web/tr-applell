@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/tr-logo.jpg" alt="TR ][ for the Commodore 64" width="640"></p>
+
 # TR ][ — an Apple ][ Plus for the TeensyROM+
 
 TR ][ is a 64K Apple ][ Plus that runs on the Teensy 4.1 inside a [TeensyROM+](https://github.com/SensoriumEmbedded/TeensyROM),
